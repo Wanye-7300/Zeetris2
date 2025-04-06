@@ -6,12 +6,18 @@
 #include <stdexcept>
 
 
-bool GameData::move(block &block, const point offset, const bool refresh_shadow) {
+bool block::operator==(const block &block) const {
+    return this->points == block.points && this->anchor == block.anchor;
+}
+
+bool GameData::move(block &block, const point<int32_t> offset, const bool refresh_shadow) {
     temp_block = block;
-    for (auto &[y, x]: block) {
+    for (auto &[y, x]: block.points) {
         y += offset.y;
         x += offset.x;
     }
+    block.anchor.y += offset.y;
+    block.anchor.x += offset.x;
     if (!check(block)) {
         block = temp_block;
         return false;
@@ -22,9 +28,51 @@ bool GameData::move(block &block, const point offset, const bool refresh_shadow)
     return true;
 }
 
-bool GameData::rotate(block &block, Rotation rotation, bool refresh_shadow) {
-    // TODO: 实现 rotate 函数
-    throw std::logic_error("Not implemented");
+bool GameData::rotate(block &block, RotationState &block_rotation_state, const BlockType block_type,
+                      const RotationState rotation, const bool refresh_shadow) {
+    auto [center_y, center_x] = rotating_centers[block_type];
+    center_y += static_cast<float>(block.anchor.y);
+    center_x += static_cast<float>(block.anchor.x);
+
+    temp_block = block;
+
+    for (auto &[y, x]: block.points) {
+        // 致敬经典
+        const float tmp_y = static_cast<float>(x) - center_x;
+        const float tmp_x = static_cast<float>(y) - center_y;
+        switch (rotation) {
+            case RotationState::Left:
+                y = static_cast<int32_t>(center_y + tmp_y);
+                x = static_cast<int32_t>(center_x - tmp_x);
+                break;
+            case RotationState::Right:
+                y = static_cast<int32_t>(center_y - tmp_y);
+                x = static_cast<int32_t>(center_x + tmp_x);
+                break;
+            default:
+                throw std::invalid_argument("Invalid rotation type");
+        }
+    }
+
+    if (!check(block)) {
+        block = temp_block;
+        return false;
+    }
+    if (refresh_shadow) {
+        this->refresh_shadow();
+    }
+
+    switch (rotation) {
+        case RotationState::Left:
+            block_rotation_state = static_cast<RotationState>((static_cast<int>(block_rotation_state) + 3) % 4);
+            break;
+        case RotationState::Right:
+            block_rotation_state = static_cast<RotationState>((static_cast<int>(block_rotation_state) + 1) % 4);
+        default:
+            break;
+    }
+
+    return true;
 }
 
 void GameData::new_bag(std::mt19937 &rng, const size_t bag_count) {
@@ -51,15 +99,22 @@ void GameData::new_block(const BlockType block_type) {
     }
 
     current_block = blocks[static_cast<size_t>(type)];
-    current_block_type = type;
-    for (auto &[y, x]: current_block) {
+    for (auto &[y, x]: current_block.points) {
         y += 20;
         x += 3;
     }
+    current_block.anchor = {20, 3};
+    current_block_type = type;
+    current_block_rotation_state = RotationState::Zero;
+    can_exchange_hold = true;
     this->refresh_shadow();
 }
 
 void GameData::exchange_hold() {
+    if (!can_exchange_hold) {
+        return;
+    }
+
     const auto temp = current_block_type;
     current_block_type = hold_block_type;
     hold_block_type = temp;
@@ -67,10 +122,12 @@ void GameData::exchange_hold() {
     // 如果 current_block_type 是 None 的话（意味着 hold 本来是 None），传给 new_block 生成一个新的；
     // 如果不是，也传给它。
     new_block(current_block_type);
+
+    can_exchange_hold = !can_exchange_hold;
 }
 
 bool GameData::check(block &block) {
-    return std::ranges::all_of(block, [this](auto point) {
+    return std::ranges::all_of(block.points, [this](auto point) {
         return 0 <= point.x && point.x < 10 && 0 <= point.y && point.y < 22 &&
                matrix[point.y][point.x] == BlockType::None;
     });
@@ -81,6 +138,54 @@ void GameData::refresh_shadow() {
     // 一直让它下落，直到下落不了了为止
     while (this->move(shadow_block, {-1, 0}, false))
         ;
+}
+
+void GameData::lock() {
+    for (auto &[y, x]: current_block.points) {
+        matrix[y][x] = current_block_type;
+    }
+    new_block();
+}
+
+void GameData::hard_drop() {
+    current_block = shadow_block;
+    lock();
+}
+
+void GameData::handle_game_logic(const size_t frame_count, std::mt19937 &rng) {
+    // 着地 / 锁定逻辑
+    if (shadow_block == current_block && on_land == false) {
+        on_land = true;
+        frame_stamp_lock = frame_count;
+    } else if (shadow_block == current_block && on_land == true && frame_count == frame_stamp_lock + 90) {
+        lock();
+    } else if (shadow_block != current_block && on_land == true) {
+        on_land = false;
+    }
+
+    // 下落逻辑
+    if (frame_count % GameConfig::down_delay == 0) {
+        move(current_block, {-1, 0});
+    }
+
+    // 处理消行逻辑
+    {
+        size_t count = 0;
+        for (size_t y = 0; y < height; y++) {
+            for (size_t x = 0; x < width; x++) {
+                matrix[y - count][x] = matrix[y][x];
+            }
+            if (std::ranges::all_of(matrix[y], [](auto block_type) { return block_type != BlockType::None; })) {
+                std::ranges::fill(matrix[y], BlockType::None);
+                count++;
+            }
+        }
+    }
+
+    // 预览块序列不足时，生成新的包
+    if (next_queue.size() == 7) {
+        new_bag(rng);
+    }
 }
 
 Game::Game(sf::RenderWindow *render_window, std::shared_ptr<sf::Font> font) {
@@ -95,19 +200,25 @@ void Game::run() {
     const auto update_vertices = [](sf::Vertex *begin, const size_t offset, const size_t y, const size_t x,
                                     const sf::Color color) {
         // 注意这里 sf::Vector2f 先是 x 再是 y 的，和项目里通行的记法正好相反
-        begin[offset + 0].position = sf::Vector2f{static_cast<float>(x + 0) * block_size,
-                                                  static_cast<float>(GameData::height - y - 1) * block_size};
-        begin[offset + 1].position = sf::Vector2f{static_cast<float>(x + 0) * block_size,
-                                                  static_cast<float>(GameData::height - y - 0) * block_size};
-        begin[offset + 2].position = sf::Vector2f{static_cast<float>(x + 1) * block_size,
-                                                  static_cast<float>(GameData::height - y - 1) * block_size};
+        begin[offset + 0].position =
+                sf::Vector2f{static_cast<float>(x + 0) * GameConfig::block_size,
+                             static_cast<float>(GameData::height - y - 1) * GameConfig::block_size};
+        begin[offset + 1].position =
+                sf::Vector2f{static_cast<float>(x + 0) * GameConfig::block_size,
+                             static_cast<float>(GameData::height - y - 0) * GameConfig::block_size};
+        begin[offset + 2].position =
+                sf::Vector2f{static_cast<float>(x + 1) * GameConfig::block_size,
+                             static_cast<float>(GameData::height - y - 1) * GameConfig::block_size};
 
-        begin[offset + 3].position = sf::Vector2f{static_cast<float>(x + 1) * block_size,
-                                                  static_cast<float>(GameData::height - y - 1) * block_size};
-        begin[offset + 4].position = sf::Vector2f{static_cast<float>(x + 0) * block_size,
-                                                  static_cast<float>(GameData::height - y - 0) * block_size};
-        begin[offset + 5].position = sf::Vector2f{static_cast<float>(x + 1) * block_size,
-                                                  static_cast<float>(GameData::height - y - 0) * block_size};
+        begin[offset + 3].position =
+                sf::Vector2f{static_cast<float>(x + 1) * GameConfig::block_size,
+                             static_cast<float>(GameData::height - y - 1) * GameConfig::block_size};
+        begin[offset + 4].position =
+                sf::Vector2f{static_cast<float>(x + 0) * GameConfig::block_size,
+                             static_cast<float>(GameData::height - y - 0) * GameConfig::block_size};
+        begin[offset + 5].position =
+                sf::Vector2f{static_cast<float>(x + 1) * GameConfig::block_size,
+                             static_cast<float>(GameData::height - y - 0) * GameConfig::block_size};
 
         for (size_t idx = offset; idx < offset + 6; idx++) {
             begin[idx].color = color;
@@ -116,11 +227,14 @@ void Game::run() {
 
     std::array<sf::Vertex, GameData::height * GameData::width * 6> vertices_matrix;
     std::array<sf::Vertex, 4 * 6> vertices_current_block;
-    sf::Text text_fps{*font_, L"", 24};
+    std::array<sf::Vertex, 5> vertices_rotating_center;
 
-    // TODO: 移除下面的两行，本来是用来调试的
-    game_data_->matrix[0][0] = BlockType::I;
-    game_data_->matrix[21][0] = BlockType::I;
+    sf::Text text_fps{*font_, L"Unknown fps", 24};
+    sf::Text text_frame_count{*font_, L"frame_count_: 0", 24};
+    sf::Text text_rotation{*font_, L"rotation: 0", 24};
+    text_frame_count.setPosition({0, text_fps.getGlobalBounds().position.y + text_fps.getGlobalBounds().size.y});
+    text_rotation.setPosition(
+            {0, text_frame_count.getGlobalBounds().position.y + text_frame_count.getGlobalBounds().size.y});
 
     // 初始化游戏数据
     auto rd = std::random_device();
@@ -131,6 +245,7 @@ void Game::run() {
     while (render_window_->isOpen()) {
         const std::chrono::time_point<std::chrono::steady_clock> start = std::chrono::steady_clock::now();
 
+        // vvv 处理游戏逻辑
         while (const std::optional event = render_window_->pollEvent()) {
             if (event->is<sf::Event::Closed>()) {
                 render_window_->close();
@@ -138,17 +253,34 @@ void Game::run() {
             }
             [[likely]] if (const auto *key_pressed = event->getIf<sf::Event::KeyPressed>()) {
                 switch (key_pressed->scancode) {
-                    case sf::Keyboard::Scancode::A:
+                    case sf::Keyboard::Scancode::Left:
                         game_data_->move(game_data_->current_block, {0, -1});
                         break;
-                    case sf::Keyboard::Scancode::D:
+                    case sf::Keyboard::Scancode::Right:
                         game_data_->move(game_data_->current_block, {0, 1});
+                        break;
+                    case sf::Keyboard::Scancode::Z:
+                        game_data_->rotate(game_data_->current_block, game_data_->current_block_rotation_state,
+                                           game_data_->current_block_type, RotationState::Left);
+                        break;
+                    case sf::Keyboard::Scancode::X:
+                        game_data_->rotate(game_data_->current_block, game_data_->current_block_rotation_state,
+                                           game_data_->current_block_type, RotationState::Right);
+                        break;
+                    case sf::Keyboard::Scancode::Space:
+                        game_data_->hard_drop();
+                        break;
+                    case sf::Keyboard::Scancode::LShift:
+                        game_data_->exchange_hold();
                         break;
                     default:
                         break;
                 }
             }
         }
+
+        game_data_->handle_game_logic(frame_count_, rng);
+        // ^^^ 处理游戏逻辑
 
         // vvv 计算 vertices
         for (size_t y = 0; y < GameData::height; y++) {
@@ -158,9 +290,23 @@ void Game::run() {
             }
         }
 
-        for (size_t idx = 0; idx < game_data_->current_block.size(); idx++) {
-            auto &[y, x] = game_data_->current_block[idx];
+        for (size_t idx = 0; idx < game_data_->current_block.points.size(); idx++) {
+            auto &[y, x] = game_data_->current_block.points[idx];
             update_vertices(vertices_current_block.data(), idx * 6, y, x, block_colors[game_data_->current_block_type]);
+        }
+
+        {
+            // -这是什么？ -是用来显示旋转中心的。 -原来是这样啊？
+            auto [center_y, center_x] = rotating_centers[game_data_->current_block_type];
+            center_y += static_cast<float>(game_data_->current_block.anchor.y - 0.5);
+            center_x += static_cast<float>(game_data_->current_block.anchor.x + 0.5);
+            center_y = (static_cast<float>(GameData::height) - center_y - 1.f) * GameConfig::block_size;
+            center_x = center_x * GameConfig::block_size;
+            vertices_rotating_center[0].position = {center_x - 5.f, center_y - 5.f};
+            vertices_rotating_center[1].position = {center_x - 5.f, center_y + 5.f};
+            vertices_rotating_center[2].position = {center_x + 5.f, center_y + 5.f};
+            vertices_rotating_center[3].position = {center_x + 5.f, center_y - 5.f};
+            vertices_rotating_center[4].position = {center_x - 5.f, center_y - 5.f};
         }
         // ^^^ 计算 vertices
 
@@ -168,10 +314,20 @@ void Game::run() {
         render_window_->draw(vertices_matrix.data(), vertices_matrix.size(), sf::PrimitiveType::Triangles);
         render_window_->draw(vertices_current_block.data(), vertices_current_block.size(),
                              sf::PrimitiveType::Triangles);
+        render_window_->draw(vertices_rotating_center.data(), vertices_rotating_center.size(),
+                             sf::PrimitiveType::LineStrip);
         render_window_->draw(text_fps);
+        render_window_->draw(text_frame_count);
+        render_window_->draw(text_rotation);
         render_window_->display();
+
+        // 帧结束，自增
+        frame_count_++;
 
         const std::chrono::time_point<std::chrono::steady_clock> end = std::chrono::steady_clock::now();
         text_fps.setString(std::format(L"{} fps", 1s / (end - start)));
+        text_frame_count.setString(std::format(L"frame_count_: {}", frame_count_));
+        text_rotation.setString(
+                std::format(L"rotation: {}", static_cast<int>(game_data_->current_block_rotation_state)));
     }
 }
