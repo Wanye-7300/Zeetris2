@@ -13,10 +13,17 @@ FetchContent_Declare(SFML
         SYSTEM)
 FetchContent_MakeAvailable(SFML)
 
+FetchContent_Declare(Boost
+        GIT_REPOSITORY https://github.com/boostorg/boost.git
+        GIT_TAG boost-1.87.0
+        GIT_SHALLOW ON)
+FetchContent_MakeAvailable(Boost)
+
 add_executable(Zeetris2 main.cpp
         game.cpp
         game.h)
 target_link_libraries(Zeetris2 PRIVATE SFML::Graphics)
+target_link_libraries(Zeetris2 PRIVATE Boost::asio Boost::bind)
 if (MSVC)
     target_compile_options(Zeetris2 PRIVATE /W4)
 endif ()

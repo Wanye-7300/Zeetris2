@@ -152,19 +152,21 @@ void GameData::hard_drop() {
     lock();
 }
 
-void GameData::handle_game_logic(const size_t frame_count, std::mt19937 &rng) {
+void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &error_code,
+                           boost::asio::steady_timer *timer, std::atomic_size_t *logical_frame_count,
+                           std::mt19937 &rng) {
     // 着地 / 锁定逻辑
     if (shadow_block == current_block && on_land == false) {
         on_land = true;
-        frame_stamp_lock = frame_count;
-    } else if (shadow_block == current_block && on_land == true && frame_count == frame_stamp_lock + 90) {
+        frame_stamp_lock = *logical_frame_count;
+    } else if (shadow_block == current_block && on_land == true && *logical_frame_count == frame_stamp_lock + 90) {
         lock();
     } else if (shadow_block != current_block && on_land == true) {
         on_land = false;
     }
 
     // 下落逻辑
-    if (frame_count % GameConfig::down_delay == 0) {
+    if (*logical_frame_count % GameConfig::down_delay == 0) {
         move(current_block, {-1, 0});
     }
 
@@ -186,12 +188,36 @@ void GameData::handle_game_logic(const size_t frame_count, std::mt19937 &rng) {
     if (next_queue.size() == 7) {
         new_bag(rng);
     }
+
+    logical_frame_count->fetch_add(1);
+
+    using namespace std::literals;
+
+    timer->expires_at(timer->expiry() + boost::asio::chrono::nanoseconds(1000000000 / 60));
+    timer->async_wait(boost::bind(&GameData::logic_frame, this, boost::asio::placeholders::error, timer,
+                                  logical_frame_count, rng));
 }
 
 Game::Game(sf::RenderWindow *render_window, std::shared_ptr<sf::Font> font) {
     game_data_ = std::make_shared<GameData>();
     font_ = std::move(font);
     render_window_ = render_window;
+}
+
+void Game::handle_game_logic(std::mt19937 &rng) {
+    using namespace std::literals;
+
+    // FIXME: 当主线程退出的时候也把这个线程一起退出，用 std::atomic_flag。
+    logical_thread_ = std::move(std::thread{[this, rng]() {
+        boost::asio::io_context io_context;
+        boost::asio::steady_timer asio_steady_timer{io_context, boost::asio::chrono::nanoseconds(1000000000 / 60)};
+        asio_steady_timer.async_wait(boost::bind(&GameData::logic_frame, game_data_.get(),
+                                                 boost::asio::placeholders::error, &asio_steady_timer,
+                                                 &logical_frame_count_, rng));
+        io_context.run();
+    }});
+
+    logical_thread_.detach();
 }
 
 void Game::run() {
@@ -231,16 +257,21 @@ void Game::run() {
 
     sf::Text text_fps{*font_, L"Unknown fps", 24};
     sf::Text text_frame_count{*font_, L"frame_count_: 0", 24};
+    sf::Text text_logical_frame_count{*font_, L"logical_frame_count_: 0", 24};
     sf::Text text_rotation{*font_, L"rotation: 0", 24};
     text_frame_count.setPosition({0, text_fps.getGlobalBounds().position.y + text_fps.getGlobalBounds().size.y});
-    text_rotation.setPosition(
+    text_logical_frame_count.setPosition(
             {0, text_frame_count.getGlobalBounds().position.y + text_frame_count.getGlobalBounds().size.y});
+    text_rotation.setPosition({0, text_logical_frame_count.getGlobalBounds().position.y +
+                                          text_logical_frame_count.getGlobalBounds().size.y});
 
     // 初始化游戏数据
     auto rd = std::random_device();
     auto rng = std::mt19937(rd());
     game_data_->new_bag(rng, 2);
     game_data_->new_block();
+
+    handle_game_logic(rng);
 
     while (render_window_->isOpen()) {
         const std::chrono::time_point<std::chrono::steady_clock> start = std::chrono::steady_clock::now();
@@ -278,8 +309,6 @@ void Game::run() {
                 }
             }
         }
-
-        game_data_->handle_game_logic(frame_count_, rng);
         // ^^^ 处理游戏逻辑
 
         // vvv 计算 vertices
@@ -318,6 +347,7 @@ void Game::run() {
                              sf::PrimitiveType::LineStrip);
         render_window_->draw(text_fps);
         render_window_->draw(text_frame_count);
+        render_window_->draw(text_logical_frame_count);
         render_window_->draw(text_rotation);
         render_window_->display();
 
@@ -327,6 +357,8 @@ void Game::run() {
         const std::chrono::time_point<std::chrono::steady_clock> end = std::chrono::steady_clock::now();
         text_fps.setString(std::format(L"{} fps", 1s / (end - start)));
         text_frame_count.setString(std::format(L"frame_count_: {}", frame_count_));
+        text_logical_frame_count.setString(
+                std::format(L"logical_frame_count_: {}", static_cast<size_t>(logical_frame_count_)));
         text_rotation.setString(
                 std::format(L"rotation: {}", static_cast<int>(game_data_->current_block_rotation_state)));
     }

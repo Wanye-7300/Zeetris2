@@ -3,11 +3,15 @@
 
 #include <SFML/Graphics.hpp>
 #include <array>
+#include <atomic>
+#include <boost/asio.hpp>
+#include <boost/bind.hpp>
 #include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
 #include <random>
+#include <thread>
 #include <utility>
 
 
@@ -210,7 +214,8 @@ public:
 
     void hard_drop();
 
-    void handle_game_logic(size_t frame_count, std::mt19937 &rng);
+    void logic_frame(const boost::system::error_code &error_code, boost::asio::steady_timer *timer,
+                     std::atomic_size_t *logical_frame_count, std::mt19937 &rng);
 };
 
 class GameConfig {
@@ -239,12 +244,18 @@ class Game {
     /// 渲染帧计数
     size_t frame_count_{};
 
+    /// 逻辑帧计数
+    std::atomic_size_t logical_frame_count_{};
+    std::thread logical_thread_;
+
 public:
     Game() = delete;
 
     explicit Game(sf::RenderWindow *render_window, std::shared_ptr<sf::Font> font);
 
     ~Game() = default;
+
+    void handle_game_logic(std::mt19937 &rng);
 
     /// 运行游戏。
     void run();

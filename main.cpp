@@ -16,7 +16,7 @@ int main() {
 
     std::println("Creating sf::RenderWindow...");
     sf::RenderWindow render_window{sf::VideoMode{sf::Vector2u{1366, 768}}, L"Zeetris 2"};
-    render_window.setFramerateLimit(60);
+    render_window.setFramerateLimit(120);
 
     Game game{&render_window, font};
     game.run();
