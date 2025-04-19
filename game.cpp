@@ -1,13 +1,30 @@
 #include "game.h"
 
 #include <algorithm>
+#include <boost/bind.hpp>
+#include <print>
 #include <random>
 #include <ranges>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 
 
 bool block::operator==(const block &block) const {
     return this->points == block.points && this->anchor == block.anchor;
+}
+
+kickwall *get_kickwall(const BlockType block_type) {
+    switch (block_type) {
+        case BlockType::I:
+            return &kickwall_I;
+        case BlockType::O:
+            return &kickwall_O;
+        case BlockType::None:
+        case BlockType::Unknown:
+            throw std::invalid_argument("Invalid block type");
+        default:
+            return &kickwall_JLSTZ;
+    }
 }
 
 bool GameData::move(block &block, const point<int32_t> offset, const bool refresh_shadow) {
@@ -54,24 +71,43 @@ bool GameData::rotate(block &block, RotationState &block_rotation_state, const B
         }
     }
 
-    if (!check(block)) {
-        block = temp_block;
-        return false;
-    }
-    if (refresh_shadow) {
-        this->refresh_shadow();
-    }
+    RotationState new_state = block_rotation_state;
 
     switch (rotation) {
         case RotationState::Left:
-            block_rotation_state = static_cast<RotationState>((static_cast<int>(block_rotation_state) + 3) % 4);
+            new_state = static_cast<RotationState>((static_cast<int>(new_state) + 3) % 4);
             break;
         case RotationState::Right:
-            block_rotation_state = static_cast<RotationState>((static_cast<int>(block_rotation_state) + 1) % 4);
+            new_state = static_cast<RotationState>((static_cast<int>(new_state) + 1) % 4);
         default:
             break;
     }
 
+    const auto temp_rotated_block = block;
+
+    for (auto &list_offset = get_kickwall(block_type)->at(std::pair{block_rotation_state, new_state});
+         auto &[offset_x, offset_y]: list_offset) {
+        for (auto &[block_y, block_x]: block.points) {
+            block_y += offset_y;
+            block_x += offset_x;
+        }
+
+        if (check(block)) {
+            block.anchor.y += offset_y;
+            block.anchor.x += offset_x;
+            goto success;
+        }
+
+        block = temp_rotated_block;
+    }
+
+    block = temp_block;
+    return false;
+success:
+    block_rotation_state = new_state;
+    if (refresh_shadow) {
+        this->refresh_shadow();
+    }
     return true;
 }
 
@@ -153,8 +189,70 @@ void GameData::hard_drop() {
 }
 
 void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &error_code,
-                           boost::asio::steady_timer *timer, std::atomic_size_t *logical_frame_count,
-                           std::mt19937 &rng) {
+                           boost::asio::steady_timer *timer, std::atomic_size_t *logical_frame_count, std::mt19937 &rng,
+                           const std::shared_ptr<Keyboard> &keyboard, std::mutex *keyboard_mutex,
+                           std::atomic_flag *flag_thread_quit) {
+    timer->expires_after(boost::asio::chrono::nanoseconds(1000000000 / 60));
+    using sf::Keyboard::Scancode;
+
+    bool move_changed = false;
+    if (keyboard->is_key_pressed(Scancode::Left)) {
+        state_move_left = state_move_right + 1;
+        move_changed = true;
+    } else if (!keyboard->is_key_pressing(Scancode::Left) && state_move_left != 0) {
+        state_move_left = 0;
+        move_changed = true;
+    }
+    if (keyboard->is_key_pressed(Scancode::Right)) {
+        state_move_right = state_move_left + 1;
+        move_changed = true;
+    } else if (!keyboard->is_key_pressing(Scancode::Right) && state_move_right != 0) {
+        state_move_right = 0;
+        move_changed = true;
+    }
+
+    if (move_changed) {
+        if (state_move_left == state_move_right) {
+            scheduled_frame_stamp_move.set_state(ScheduledState::Inactive);
+            move_offset.x = 0;
+        } else {
+            spdlog::debug("Move started at frame {}", logical_frame_count->load());
+            scheduled_frame_stamp_move.set_state(ScheduledState::Loop);
+            scheduled_frame_stamp_move.set_frame_stamp(*logical_frame_count);
+            scheduled_frame_stamp_move.set_duration(GameConfig::DAS);
+            scheduled_frame_stamp_move.set_next_duration(std::make_optional(GameConfig::ARR));
+            move_offset.x = state_move_left > state_move_right ? -1 : 1;
+            // 按下的那一瞬间也是要移动的
+            move(current_block, move_offset);
+        }
+    }
+
+    if (keyboard->is_key_pressed(Scancode::Z)) {
+        rotate(current_block, current_block_rotation_state, current_block_type, RotationState::Left);
+    }
+    if (keyboard->is_key_pressed(Scancode::X)) {
+        rotate(current_block, current_block_rotation_state, current_block_type, RotationState::Right);
+    }
+    if (keyboard->is_key_pressed(Scancode::Space)) {
+        hard_drop();
+    }
+    if (keyboard->is_key_pressed(Scancode::LShift)) {
+        exchange_hold();
+    }
+    if (keyboard->is_key_pressed(Scancode::Down)) {
+        scheduled_frame_stamp_down.set_duration(GameConfig::soft_down_delay);
+    } else if (!keyboard->is_key_pressing(Scancode::Down)) {
+        scheduled_frame_stamp_down.set_duration(GameConfig::down_delay);
+    }
+    {
+        std::lock_guard guard(*keyboard_mutex);
+        keyboard->update();
+    }
+
+    if (scheduled_frame_stamp_move.on_update(*logical_frame_count)) {
+        move(current_block, move_offset);
+    }
+
     // 着地 / 锁定逻辑
     if (shadow_block == current_block && on_land == false) {
         on_land = true;
@@ -166,7 +264,7 @@ void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &err
     }
 
     // 下落逻辑
-    if (*logical_frame_count % GameConfig::down_delay == 0) {
+    if (scheduled_frame_stamp_down.on_update(*logical_frame_count)) {
         move(current_block, {-1, 0});
     }
 
@@ -191,30 +289,37 @@ void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &err
 
     logical_frame_count->fetch_add(1);
 
+    if (flag_thread_quit->test()) {
+        return;
+    }
+
     using namespace std::literals;
 
-    timer->expires_at(timer->expiry() + boost::asio::chrono::nanoseconds(1000000000 / 60));
     timer->async_wait(boost::bind(&GameData::logic_frame, this, boost::asio::placeholders::error, timer,
-                                  logical_frame_count, rng));
+                                  logical_frame_count, rng, keyboard, keyboard_mutex, flag_thread_quit));
 }
 
 Game::Game(sf::RenderWindow *render_window, std::shared_ptr<sf::Font> font) {
     game_data_ = std::make_shared<GameData>();
+    keyboard_ = std::make_shared<Keyboard>();
     font_ = std::move(font);
     render_window_ = render_window;
 }
 
-void Game::handle_game_logic(std::mt19937 &rng) {
+void Game::handle_game_logic(std::mt19937 &rng, std::atomic_flag *flag_thread_quit) {
     using namespace std::literals;
 
-    // FIXME: 当主线程退出的时候也把这个线程一起退出，用 std::atomic_flag。
-    logical_thread_ = std::move(std::thread{[this, rng]() {
+    logical_thread_ = std::move(std::thread{[this, rng, flag_thread_quit]() {
         boost::asio::io_context io_context;
         boost::asio::steady_timer asio_steady_timer{io_context, boost::asio::chrono::nanoseconds(1000000000 / 60)};
-        asio_steady_timer.async_wait(boost::bind(&GameData::logic_frame, game_data_.get(),
-                                                 boost::asio::placeholders::error, &asio_steady_timer,
-                                                 &logical_frame_count_, rng));
+        asio_steady_timer.async_wait(boost::bind(&GameData::logic_frame, game_data_, boost::asio::placeholders::error,
+                                                 &asio_steady_timer, &logical_frame_count_, rng, keyboard_,
+                                                 &keyboard_mutex_, flag_thread_quit));
+        spdlog::info("Game logic thread has been started");
         io_context.run();
+        spdlog::info("Game logic thread has been quit");
+        flag_thread_quit->test_and_set();
+        flag_thread_quit->notify_all();
     }});
 
     logical_thread_.detach();
@@ -265,13 +370,15 @@ void Game::run() {
     text_rotation.setPosition({0, text_logical_frame_count.getGlobalBounds().position.y +
                                           text_logical_frame_count.getGlobalBounds().size.y});
 
+    std::atomic_flag flag_thread_quit{};
+
     // 初始化游戏数据
     auto rd = std::random_device();
     auto rng = std::mt19937(rd());
     game_data_->new_bag(rng, 2);
     game_data_->new_block();
 
-    handle_game_logic(rng);
+    handle_game_logic(rng, &flag_thread_quit);
 
     while (render_window_->isOpen()) {
         const std::chrono::time_point<std::chrono::steady_clock> start = std::chrono::steady_clock::now();
@@ -280,35 +387,14 @@ void Game::run() {
         while (const std::optional event = render_window_->pollEvent()) {
             if (event->is<sf::Event::Closed>()) {
                 render_window_->close();
+                flag_thread_quit.test_and_set();
                 return;
             }
-            [[likely]] if (const auto *key_pressed = event->getIf<sf::Event::KeyPressed>()) {
-                switch (key_pressed->scancode) {
-                    case sf::Keyboard::Scancode::Left:
-                        game_data_->move(game_data_->current_block, {0, -1});
-                        break;
-                    case sf::Keyboard::Scancode::Right:
-                        game_data_->move(game_data_->current_block, {0, 1});
-                        break;
-                    case sf::Keyboard::Scancode::Z:
-                        game_data_->rotate(game_data_->current_block, game_data_->current_block_rotation_state,
-                                           game_data_->current_block_type, RotationState::Left);
-                        break;
-                    case sf::Keyboard::Scancode::X:
-                        game_data_->rotate(game_data_->current_block, game_data_->current_block_rotation_state,
-                                           game_data_->current_block_type, RotationState::Right);
-                        break;
-                    case sf::Keyboard::Scancode::Space:
-                        game_data_->hard_drop();
-                        break;
-                    case sf::Keyboard::Scancode::LShift:
-                        game_data_->exchange_hold();
-                        break;
-                    default:
-                        break;
-                }
-            }
+
+            std::lock_guard guard(keyboard_mutex_);
+            keyboard_->update_event(*event);
         }
+        // keyboard_->update();
         // ^^^ 处理游戏逻辑
 
         // vvv 计算 vertices

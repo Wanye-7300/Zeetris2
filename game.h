@@ -5,7 +5,6 @@
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
-#include <boost/bind.hpp>
 #include <cstdint>
 #include <list>
 #include <map>
@@ -13,6 +12,9 @@
 #include <random>
 #include <thread>
 #include <utility>
+
+#include "keyboard.h"
+#include "scheduled_frame_stamp.h"
 
 
 /// 表示一个点 / 一个坐标。由于这个项目的特殊性，先存储 y 再存储 x，要与 SFML 中通行的 (x, y) 存储方式区别开来。
@@ -114,6 +116,7 @@ static std::map<BlockType, sf::Color> block_colors{
         {BlockType::T, sf::Color{128, 0, 128}},
 };
 
+/// 预设值，表示一种方块对应的旋转中心（相对于锚点）
 static std::map<BlockType, point<float>> rotating_centers{
         {BlockType::None, {0.f, 0.f}}, {BlockType::I, {-0.5f, 1.5f}}, {BlockType::J, {0.f, 1.f}},
         {BlockType::L, {0.f, 1.f}},    {BlockType::O, {0.5f, 1.5f}},  {BlockType::S, {0.f, 1.f}},
@@ -132,6 +135,78 @@ enum class RotationState {
     Two = 2,
     /// 初始态逆时针旋转（左转）后的状态 / 逆时针旋转
     Left = 3,
+};
+
+using kickwall = std::map<std::pair<RotationState, RotationState>, std::vector<point<int32_t>>>;
+
+/// JLSTZ 的踢墙表
+static kickwall kickwall_JLSTZ{{std::pair{RotationState::Zero, RotationState::Right},
+                                std::vector{point{0, 0}, {-1, 0}, {-1, +1}, {0, -2}, {-1, -2}}},
+                               {std::pair{RotationState::Right, RotationState::Zero},
+                                std::vector{point{0, 0}, {+1, 0}, {+1, -1}, {0, +2}, {+1, +2}}},
+                               {std::pair{RotationState::Right, RotationState::Two},
+                                std::vector{point{0, 0}, {+1, 0}, {+1, -1}, {0, +2}, {+1, +2}}},
+                               {std::pair{RotationState::Two, RotationState::Right},
+                                std::vector{point{0, 0}, {-1, 0}, {-1, +1}, {0, -2}, {-1, -2}}},
+                               {std::pair{RotationState::Two, RotationState::Left},
+                                std::vector{point{0, 0}, {+1, 0}, {+1, +1}, {0, -2}, {+1, -2}}},
+                               {std::pair{RotationState::Left, RotationState::Two},
+                                std::vector{point{0, 0}, {-1, 0}, {-1, -1}, {0, +2}, {-1, +2}}},
+                               {std::pair{RotationState::Left, RotationState::Zero},
+                                std::vector{point{0, 0}, {-1, 0}, {-1, -1}, {0, +2}, {-1, +2}}},
+                               {std::pair{RotationState::Zero, RotationState::Left},
+                                std::vector{point{0, 0}, {+1, 0}, {+1, +1}, {0, -2}, {+1, -2}}}};
+
+/// I 的踢墙表
+static kickwall kickwall_I{{std::pair{RotationState::Zero, RotationState::Right},
+                            std::vector{point{0, 0}, {-2, 0}, {+1, 0}, {-2, -1}, {+1, +2}}},
+                           {std::pair{RotationState::Right, RotationState::Zero},
+                            std::vector{point{0, 0}, {+2, 0}, {-1, 0}, {+2, +1}, {-1, -2}}},
+                           {std::pair{RotationState::Right, RotationState::Two},
+                            std::vector{point{0, 0}, {-1, 0}, {+2, 0}, {-1, +2}, {+2, -1}}},
+                           {std::pair{RotationState::Two, RotationState::Right},
+                            std::vector{point{0, 0}, {+1, 0}, {-2, 0}, {+1, -2}, {-2, +1}}},
+                           {std::pair{RotationState::Two, RotationState::Left},
+                            std::vector{point{0, 0}, {+2, 0}, {-1, 0}, {+2, +1}, {-1, -2}}},
+                           {std::pair{RotationState::Left, RotationState::Two},
+                            std::vector{point{0, 0}, {-2, 0}, {+1, 0}, {-2, -1}, {+1, +2}}},
+                           {std::pair{RotationState::Left, RotationState::Zero},
+                            std::vector{point{0, 0}, {+1, 0}, {-2, 0}, {+1, -2}, {-2, +1}}},
+                           {std::pair{RotationState::Zero, RotationState::Left},
+                            std::vector{point{0, 0}, {-1, 0}, {+2, 0}, {-1, +2}, {+2, -1}}}};
+
+/// O 的踢墙表（实际上没有）
+static kickwall kickwall_O{{std::pair{RotationState::Zero, RotationState::Right}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Right, RotationState::Zero}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Right, RotationState::Two}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Two, RotationState::Right}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Two, RotationState::Left}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Left, RotationState::Two}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Left, RotationState::Zero}, std::vector<point<int32_t>>{}},
+                           {std::pair{RotationState::Zero, RotationState::Left}, std::vector<point<int32_t>>{}}};
+
+/// 获取对应方块类型的踢墙表。
+/// @param block_type 获取的方块类型
+/// @return 对应方块类型的踢墙表
+kickwall *get_kickwall(BlockType block_type);
+
+/// 游戏设置
+class GameConfig {
+public:
+    /// 渲染相关：方块大小
+    static constexpr float block_size = 25.f;
+
+    /// 逻辑相关：下降延迟 (frame / 60 frames)
+    static constexpr size_t down_delay = 60;
+    /// 逻辑相关：软降延迟 (frame / 60 frames)
+    static constexpr size_t soft_down_delay = 3;
+    /// 逻辑相关：锁定延迟 (frame / 60 frames)
+    static constexpr size_t lock_delay = 90;
+
+    /// 操作相关：自动移动延迟 (DAS) (frame / 60 frames)
+    static constexpr size_t DAS = 10;
+    /// 操作相关：移动重复延迟 (ARR) (frame / 60 frames)
+    static constexpr size_t ARR = 2;
 };
 
 /// 用来存储游戏数据的类。一些与游戏数据操作有关的方法也放在这里面，但是不是 static 的。
@@ -168,6 +243,23 @@ public:
     bool on_land = false;
     /// 如果锁在地上，开始的帧数戳
     size_t frame_stamp_lock{};
+
+    /// 锁定计划帧
+    ScheduledFrameStamp scheduled_frame_stamp_lock{0, GameConfig::lock_delay};
+    /// 下降计划帧
+    ScheduledFrameStamp scheduled_frame_stamp_down{0, GameConfig::down_delay, ScheduledState::Loop};
+
+    /// 移动计划帧
+    ScheduledFrameStamp scheduled_frame_stamp_move{0, GameConfig::DAS};
+    /// 左移的状态。
+    /// 请见代码中对这个变量的具体解释。
+    int8_t state_move_left{0};
+    /// 右移的状态。
+    /// 请见代码中对这个变量的具体解释。
+    int8_t state_move_right{0};
+    /// 移动的偏移
+    /// 请见代码中对这个变量的具体解释。
+    point<int32_t> move_offset{0, 0};
 
     GameData() = default;
     ~GameData() = default;
@@ -210,32 +302,27 @@ public:
     /// 刷新影子方块。
     void refresh_shadow();
 
+    /// 锁定当前方块。
     void lock();
 
+    /// 硬降。
     void hard_drop();
 
+    /// 逻辑帧。处理逻辑的主要地方。
     void logic_frame(const boost::system::error_code &error_code, boost::asio::steady_timer *timer,
-                     std::atomic_size_t *logical_frame_count, std::mt19937 &rng);
-};
-
-class GameConfig {
-public:
-    /// 渲染相关：方块大小
-    static constexpr float block_size = 25.f;
-
-    /// 逻辑相关：下降延迟 (frame / 60 frames)
-    static constexpr size_t down_delay = 60;
-    /// 逻辑相关：软降延迟 (frame / 60 frames)
-    static constexpr size_t soft_down_delay = 30;
-
-    /// 逻辑相关：锁定延迟 (frame / 60 frames)
-    static constexpr size_t lock_delay = 90;
+                     std::atomic_size_t *logical_frame_count, std::mt19937 &rng,
+                     const std::shared_ptr<Keyboard> &keyboard, std::mutex *keyboard_mutex,
+                     std::atomic_flag *flag_thread_quit);
 };
 
 /// 游戏主类。
 class Game {
     /// 游戏数据
     std::shared_ptr<GameData> game_data_;
+    /// 键盘状态
+    std::shared_ptr<Keyboard> keyboard_;
+    /// 键盘状态的锁
+    std::mutex keyboard_mutex_;
     /// 字体，由 main 传过来
     std::shared_ptr<sf::Font> font_;
     /// 要渲染的窗口，从 main 传过来
@@ -246,6 +333,7 @@ class Game {
 
     /// 逻辑帧计数
     std::atomic_size_t logical_frame_count_{};
+    /// 逻辑线程
     std::thread logical_thread_;
 
 public:
@@ -255,7 +343,10 @@ public:
 
     ~Game() = default;
 
-    void handle_game_logic(std::mt19937 &rng);
+    /// 管理逻辑线程。
+    /// @param rng 随机数生成器
+    /// @param flag_thread_quit 指示线程退出的 std::atomic_flag
+    void handle_game_logic(std::mt19937 &rng, std::atomic_flag *flag_thread_quit);
 
     /// 运行游戏。
     void run();

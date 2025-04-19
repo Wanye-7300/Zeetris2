@@ -19,11 +19,22 @@ FetchContent_Declare(Boost
         GIT_SHALLOW ON)
 FetchContent_MakeAvailable(Boost)
 
+FetchContent_Declare(spdlog
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG v1.15.2
+        GIT_SHALLOW ON)
+FetchContent_MakeAvailable(spdlog)
+
 add_executable(Zeetris2 main.cpp
         game.cpp
-        game.h)
+        game.h
+        scheduled_frame_stamp.cpp
+        scheduled_frame_stamp.h
+        keyboard.cpp
+        keyboard.h)
 target_link_libraries(Zeetris2 PRIVATE SFML::Graphics)
 target_link_libraries(Zeetris2 PRIVATE Boost::asio Boost::bind)
+target_link_libraries(Zeetris2 PRIVATE spdlog::spdlog)
 if (MSVC)
     target_compile_options(Zeetris2 PRIVATE /W4)
 endif ()
