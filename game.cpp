@@ -143,6 +143,9 @@ void GameData::new_block(const BlockType block_type) {
     current_block_type = type;
     current_block_rotation_state = RotationState::Zero;
     can_exchange_hold = true;
+    on_land = false;
+    scheduled_frame_stamp_down.set_frame_stamp(*logical_frame_count);
+    scheduled_frame_stamp_down.set_state(ScheduledState::Loop);
     this->refresh_shadow();
 }
 
@@ -254,13 +257,16 @@ void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &err
     }
 
     // 着地 / 锁定逻辑
-    if (shadow_block == current_block && on_land == false) {
-        on_land = true;
-        frame_stamp_lock = *logical_frame_count;
-    } else if (shadow_block == current_block && on_land == true && *logical_frame_count == frame_stamp_lock + 90) {
+    if (shadow_block == current_block && !scheduled_frame_stamp_lock.is_active()) {
+        scheduled_frame_stamp_lock.set_active(*logical_frame_count);
+        scheduled_frame_stamp_down.set_state(ScheduledState::Inactive);
+    } else if (shadow_block != current_block && scheduled_frame_stamp_lock.is_active()) {
+        scheduled_frame_stamp_lock.set_state(ScheduledState::Inactive);
+        scheduled_frame_stamp_down.set_frame_stamp(*logical_frame_count);
+        scheduled_frame_stamp_down.set_state(ScheduledState::Loop);
+    }
+    if (scheduled_frame_stamp_lock.on_update(*logical_frame_count)) {
         lock();
-    } else if (shadow_block != current_block && on_land == true) {
-        on_land = false;
     }
 
     // 下落逻辑
@@ -271,14 +277,19 @@ void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &err
     // 处理消行逻辑
     {
         size_t count = 0;
-        for (size_t y = 0; y < height; y++) {
-            for (size_t x = 0; x < width; x++) {
-                matrix[y - count][x] = matrix[y][x];
-            }
+        for (size_t y = 0; y < height_main + height_buffer; y++) {
             if (std::ranges::all_of(matrix[y], [](auto block_type) { return block_type != BlockType::None; })) {
                 std::ranges::fill(matrix[y], BlockType::None);
                 count++;
+            } else if (count != 0) {
+                for (size_t x = 0; x < width; x++) {
+                    matrix[y - count][x] = matrix[y][x];
+                }
+                std::ranges::fill(matrix[y], BlockType::None);
             }
+        }
+        if (count > 0) {
+            refresh_shadow();
         }
     }
 
@@ -300,7 +311,7 @@ void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &err
 }
 
 Game::Game(sf::RenderWindow *render_window, std::shared_ptr<sf::Font> font) {
-    game_data_ = std::make_shared<GameData>();
+    game_data_ = std::make_shared<GameData>(&logical_frame_count_);
     keyboard_ = std::make_shared<Keyboard>();
     font_ = std::move(font);
     render_window_ = render_window;
@@ -328,36 +339,46 @@ void Game::handle_game_logic(std::mt19937 &rng, std::atomic_flag *flag_thread_qu
 void Game::run() {
     using namespace std::literals; // 启用后缀，例如 24h, 1ms, 1s 之类的
 
-    const auto update_vertices = [](sf::Vertex *begin, const size_t offset, const size_t y, const size_t x,
-                                    const sf::Color color) {
-        // 注意这里 sf::Vector2f 先是 x 再是 y 的，和项目里通行的记法正好相反
-        begin[offset + 0].position =
-                sf::Vector2f{static_cast<float>(x + 0) * GameConfig::block_size,
-                             static_cast<float>(GameData::height - y - 1) * GameConfig::block_size};
-        begin[offset + 1].position =
-                sf::Vector2f{static_cast<float>(x + 0) * GameConfig::block_size,
-                             static_cast<float>(GameData::height - y - 0) * GameConfig::block_size};
-        begin[offset + 2].position =
-                sf::Vector2f{static_cast<float>(x + 1) * GameConfig::block_size,
-                             static_cast<float>(GameData::height - y - 1) * GameConfig::block_size};
+    const auto update_vertices = [this](sf::Vertex *begin, const size_t offset, const size_t position_y,
+                                        const size_t position_x, const sf::Color color) {
+        auto [screen_width, screen_height] = this->render_window_->getSize();
+        const auto offset_width = static_cast<float>(screen_width) / 2.f -
+                                  static_cast<float>(GameData::width) / 2.f * GameConfig::block_size;
+        const auto offset_height = static_cast<float>(screen_height) / 2.f -
+                                   static_cast<float>(GameData::height_main) / 2.f * GameConfig::block_size;
 
-        begin[offset + 3].position =
-                sf::Vector2f{static_cast<float>(x + 1) * GameConfig::block_size,
-                             static_cast<float>(GameData::height - y - 1) * GameConfig::block_size};
-        begin[offset + 4].position =
-                sf::Vector2f{static_cast<float>(x + 0) * GameConfig::block_size,
-                             static_cast<float>(GameData::height - y - 0) * GameConfig::block_size};
-        begin[offset + 5].position =
-                sf::Vector2f{static_cast<float>(x + 1) * GameConfig::block_size,
-                             static_cast<float>(GameData::height - y - 0) * GameConfig::block_size};
+        const auto y = static_cast<int32_t>(position_y);
+        const auto x = static_cast<int32_t>(position_x);
+
+        // 注意这里 sf::Vector2f 先是 x 再是 y 的，和项目里通行的记法正好相反
+        begin[offset + 0].position = sf::Vector2f{
+                static_cast<float>(x + 0) * GameConfig::block_size + offset_width,
+                static_cast<float>(GameData::height_main - y - 1) * GameConfig::block_size + offset_height};
+        begin[offset + 1].position = sf::Vector2f{
+                static_cast<float>(x + 0) * GameConfig::block_size + offset_width,
+                static_cast<float>(GameData::height_main - y - 0) * GameConfig::block_size + offset_height};
+        begin[offset + 2].position = sf::Vector2f{
+                static_cast<float>(x + 1) * GameConfig::block_size + offset_width,
+                static_cast<float>(GameData::height_main - y - 1) * GameConfig::block_size + offset_height};
+
+        begin[offset + 3].position = sf::Vector2f{
+                static_cast<float>(x + 1) * GameConfig::block_size + offset_width,
+                static_cast<float>(GameData::height_main - y - 1) * GameConfig::block_size + offset_height};
+        begin[offset + 4].position = sf::Vector2f{
+                static_cast<float>(x + 0) * GameConfig::block_size + offset_width,
+                static_cast<float>(GameData::height_main - y - 0) * GameConfig::block_size + offset_height};
+        begin[offset + 5].position = sf::Vector2f{
+                static_cast<float>(x + 1) * GameConfig::block_size + offset_width,
+                static_cast<float>(GameData::height_main - y - 0) * GameConfig::block_size + offset_height};
 
         for (size_t idx = offset; idx < offset + 6; idx++) {
             begin[idx].color = color;
         }
     };
 
-    std::array<sf::Vertex, GameData::height * GameData::width * 6> vertices_matrix;
+    std::array<sf::Vertex, (GameData::height_main + GameData::height_buffer) * GameData::width * 6> vertices_matrix;
     std::array<sf::Vertex, 4 * 6> vertices_current_block;
+    std::array<sf::Vertex, 4 * 6> vertices_shadow_block;
     std::array<sf::Vertex, 5> vertices_rotating_center;
 
     sf::Text text_fps{*font_, L"Unknown fps", 24};
@@ -398,7 +419,7 @@ void Game::run() {
         // ^^^ 处理游戏逻辑
 
         // vvv 计算 vertices
-        for (size_t y = 0; y < GameData::height; y++) {
+        for (size_t y = 0; y < GameData::height_main + GameData::height_buffer; y++) {
             for (size_t x = 0; x < GameData::width; x++) {
                 const size_t offset = (y * GameData::width + x) * 6;
                 update_vertices(vertices_matrix.data(), offset, y, x, block_colors[game_data_->matrix[y][x]]);
@@ -410,31 +431,42 @@ void Game::run() {
             update_vertices(vertices_current_block.data(), idx * 6, y, x, block_colors[game_data_->current_block_type]);
         }
 
+        for (size_t idx = 0; idx < game_data_->shadow_block.points.size(); idx++) {
+            auto &[y, x] = game_data_->shadow_block.points[idx];
+            update_vertices(vertices_shadow_block.data(), idx * 6, y, x, sf::Color{255, 255, 255, 196});
+        }
+
         {
             // -这是什么？ -是用来显示旋转中心的。 -原来是这样啊？
+            auto [screen_width, screen_height] = this->render_window_->getSize();
+            const auto offset_width = static_cast<float>(screen_width) / 2.f -
+                                      static_cast<float>(GameData::width) / 2.f * GameConfig::block_size;
+            const auto offset_height = static_cast<float>(screen_height) / 2.f -
+                                       static_cast<float>(GameData::height_main) / 2.f * GameConfig::block_size;
             auto [center_y, center_x] = rotating_centers[game_data_->current_block_type];
             center_y += static_cast<float>(game_data_->current_block.anchor.y - 0.5);
             center_x += static_cast<float>(game_data_->current_block.anchor.x + 0.5);
-            center_y = (static_cast<float>(GameData::height) - center_y - 1.f) * GameConfig::block_size;
+            center_y = (static_cast<float>(GameData::height_main) - center_y - 1.f) * GameConfig::block_size;
             center_x = center_x * GameConfig::block_size;
-            vertices_rotating_center[0].position = {center_x - 5.f, center_y - 5.f};
-            vertices_rotating_center[1].position = {center_x - 5.f, center_y + 5.f};
-            vertices_rotating_center[2].position = {center_x + 5.f, center_y + 5.f};
-            vertices_rotating_center[3].position = {center_x + 5.f, center_y - 5.f};
-            vertices_rotating_center[4].position = {center_x - 5.f, center_y - 5.f};
+            vertices_rotating_center[0].position = {center_x - 5.f + offset_width, center_y - 5.f + offset_height};
+            vertices_rotating_center[1].position = {center_x - 5.f + offset_width, center_y + 5.f + offset_height};
+            vertices_rotating_center[2].position = {center_x + 5.f + offset_width, center_y + 5.f + offset_height};
+            vertices_rotating_center[3].position = {center_x + 5.f + offset_width, center_y - 5.f + offset_height};
+            vertices_rotating_center[4].position = {center_x - 5.f + offset_width, center_y - 5.f + offset_height};
         }
         // ^^^ 计算 vertices
 
         render_window_->clear();
+        render_window_->draw(text_fps);
+        render_window_->draw(text_frame_count);
+        render_window_->draw(text_logical_frame_count);
+        render_window_->draw(text_rotation);
         render_window_->draw(vertices_matrix.data(), vertices_matrix.size(), sf::PrimitiveType::Triangles);
         render_window_->draw(vertices_current_block.data(), vertices_current_block.size(),
                              sf::PrimitiveType::Triangles);
         render_window_->draw(vertices_rotating_center.data(), vertices_rotating_center.size(),
                              sf::PrimitiveType::LineStrip);
-        render_window_->draw(text_fps);
-        render_window_->draw(text_frame_count);
-        render_window_->draw(text_logical_frame_count);
-        render_window_->draw(text_rotation);
+        render_window_->draw(vertices_shadow_block.data(), vertices_shadow_block.size(), sf::PrimitiveType::Triangles);
         render_window_->display();
 
         // 帧结束，自增

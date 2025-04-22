@@ -36,3 +36,7 @@ void ScheduledFrameStamp::set_active(const size_t &frame_stamp_count) {
     state_ = ScheduledState::Active;
     frame_stamp_ = frame_stamp_count;
 }
+
+bool ScheduledFrameStamp::is_active() const {
+    return state_ == ScheduledState::Active || state_ == ScheduledState::Loop;
+}

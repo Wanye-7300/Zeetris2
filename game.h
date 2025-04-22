@@ -229,13 +229,17 @@ public:
     /// 预览序列。这是一个链表 list。
     std::list<BlockType> next_queue{};
 
-    /// 场地的高 (y)
-    static constexpr size_t height = 22;
+    /// 主场地的高 (y)
+    static constexpr int32_t height_main = 20;
+    /// 缓冲区的高 (y + height_main)
+    static constexpr int32_t height_buffer = 2;
     /// 场地的宽 (x)
     static constexpr size_t width = 10;
 
     /// 场地 / 矩阵，y = 0 为底，以 matrix[y][x] 的方式访问。
-    std::array<std::array<BlockType, width>, height> matrix{};
+    std::array<std::array<BlockType, width>, height_main + height_buffer> matrix{};
+
+    std::atomic_size_t *logical_frame_count = nullptr;
 
     /// 是否可以交换暂存块
     bool can_exchange_hold = true;
@@ -253,15 +257,16 @@ public:
     ScheduledFrameStamp scheduled_frame_stamp_move{0, GameConfig::DAS};
     /// 左移的状态。
     /// 请见代码中对这个变量的具体解释。
-    int8_t state_move_left{0};
+    int32_t state_move_left{0};
     /// 右移的状态。
     /// 请见代码中对这个变量的具体解释。
-    int8_t state_move_right{0};
+    int32_t state_move_right{0};
     /// 移动的偏移
     /// 请见代码中对这个变量的具体解释。
     point<int32_t> move_offset{0, 0};
 
-    GameData() = default;
+    explicit GameData(std::atomic_size_t *logical_frame_count) : logical_frame_count(logical_frame_count) {}
+    GameData() = delete;
     ~GameData() = default;
 
     /// 移动选定的方块。
