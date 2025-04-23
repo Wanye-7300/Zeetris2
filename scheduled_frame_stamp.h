@@ -50,7 +50,7 @@ public:
 
     [[nodiscard]] bool on_update(const size_t &frame_stamp_count);
     void set_active(const size_t &frame_stamp_count);
-    bool is_active() const;
+    [[nodiscard]] bool is_active() const;
 };
 
 #endif // SCHEDULED_FRAME_STAMP_H

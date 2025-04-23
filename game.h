@@ -5,7 +5,6 @@
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
-#include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
@@ -246,7 +245,7 @@ public:
     /// 当前方块是否在地上
     bool on_land = false;
     /// 如果锁在地上，开始的帧数戳
-    size_t frame_stamp_lock{};
+    [[deprecated]] size_t frame_stamp_lock{};
 
     /// 锁定计划帧
     ScheduledFrameStamp scheduled_frame_stamp_lock{0, GameConfig::lock_delay};
@@ -264,6 +263,8 @@ public:
     /// 移动的偏移
     /// 请见代码中对这个变量的具体解释。
     point<int32_t> move_offset{0, 0};
+
+    size_t clear_line_count{};
 
     explicit GameData(std::atomic_size_t *logical_frame_count) : logical_frame_count(logical_frame_count) {}
     GameData() = delete;

@@ -289,6 +289,8 @@ void GameData::logic_frame([[maybe_unused]] const boost::system::error_code &err
             }
         }
         if (count > 0) {
+            clear_line_count += count;
+            spdlog::info("Cleared {} lines, {} in total", count, clear_line_count);
             refresh_shadow();
         }
     }
